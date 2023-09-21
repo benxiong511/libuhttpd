@@ -104,8 +104,57 @@ static void uh_server_free(struct uh_server *srv)
 #endif
 }
 
+
+/* 监测请求回调 */
+static void monitor_request_cb(struct ev_loop *loop, struct ev_timer *m, int revents)
+{
+	struct uh_server_internal *srvi = container_of(m, struct uh_server_internal, m_request_watcher);
+	struct uh_connection_internal *conni;
+	struct uh_listener *l;
+	char i = 0;
+   
+	/*无连接不管*/
+	if(list_empty(&srvi->conns))
+    {
+        log_debug("No network link\n");
+        goto end;
+    }
+	
+	list_for_each_entry(l, &srvi->listeners, list)
+	{
+		list_for_each_entry(conni, &srvi->conns, list)
+		{
+            i++;
+            /* 停止接收请求，等待目前的请求处理完毕 */
+            if(i >= 10)
+            {
+                log_err("Stop recv request.Please wait....\n");
+                ev_io_stop(srvi->loop, &l->ior);
+              
+            }else
+            {
+                log_err("Start recv request.\n");
+                /* 打开事件接收器，开始接收请求 */
+                ev_io_start(srvi->loop, &l->ior);
+               
+            }
+		}
+       
+	}
+    log_err("---Link num  %d-----\n",i);
+
+end:
+    ev_timer_set(m, 1, 0.0);
+	ev_timer_start(loop, m);
+				
+}
+
+
+
 static void uh_accept_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 {
+    int conn_sum = 0;
+    struct uh_connection_internal *conni;
     struct uh_listener *l = container_of(w, struct uh_listener, ior);
     union {
         struct sockaddr     sa;
@@ -116,6 +165,20 @@ static void uh_accept_cb(struct ev_loop *loop, struct ev_io *w, int revents)
     char addr_str[INET6_ADDRSTRLEN];
     int port;
     int sock;
+    
+    //conn_sum = 0;
+    /* 查看整个连接列表*/
+    list_for_each_entry(conni,&l->srv->conns,list)
+    {
+        conn_sum++;
+    }
+    //log_info("Conn_sum %d \n",conn_sum);
+    if(conn_sum >12)
+    {
+        //log_info("Can not connect server. \n");
+        return;
+    }
+   
 
     sock = accept4(l->sock, (struct sockaddr *)&addr, &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (sock < 0) {
@@ -344,13 +407,6 @@ static void uh_set_loop(struct uh_server *srv, struct ev_loop *loop)
     srvi->loop = loop;
 }
 
-static void uh_reuse_port(struct uh_server *srv, bool val)
-{
-    struct uh_server_internal *srvi = (struct uh_server_internal *)srv;
-
-    srvi->reuse_port = val;
-}
-
 static int parse_address(const char *addr, char **host, char **port)
 {
     static char buf[256];
@@ -427,14 +483,11 @@ static int uh_server_listen(struct uh_server *srv, const char *addr, bool ssl)
 
         /* required to get parallel v4 + v6 working */
         if (p->ai_family == AF_INET6 && setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(int)) < 0) {
-            log_err("setsockopt: IPV6_V6ONLY: %s\n", strerror(errno));
+            log_err("setsockopt: %s\n", strerror(errno));
             goto err;
         }
 
-        if (srvi->reuse_port && setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(int))) {
-            log_err("setsockopt: SO_REUSEPORT: %s\n", strerror(errno));
-            goto err;
-        }
+        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(int));
 
         if (bind(sock, p->ai_addr, p->ai_addrlen) < 0) {
             log_err("bind: %s\n", strerror(errno));
@@ -482,6 +535,10 @@ err:
 
     freeaddrinfo(addrs);
 
+    /* 这边暂时开启拥塞监测机制 */
+    ev_timer_init(&srvi->m_request_watcher, monitor_request_cb, 1, 0.0);
+    ev_timer_start(srvi->loop, &srvi->m_request_watcher);
+
     return bound;
 }
 
@@ -502,7 +559,6 @@ void uh_server_init(struct uh_server *srv, struct ev_loop *loop)
     srv->set_loop = uh_set_loop;
     srv->free = uh_server_free;
 
-    srv->reuse_port = uh_reuse_port;
     srv->listen = uh_server_listen;
 
 #ifdef SSL_SUPPORT
